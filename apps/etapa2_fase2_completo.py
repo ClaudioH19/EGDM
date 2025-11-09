@@ -132,35 +132,31 @@ def resolve_path(image_id: str):
             return p
     return None
 
-
-def image_features(path):
-    """Features ligeras para Etapa 2: medias/std RGB + entropía (en gris)."""
-    try:
-        if path is None or not os.path.exists(path):
-            return (float("nan"),)*7
-        im = Image.open(path).convert("RGB")
-        # Re-muestreo para acelerar (ideal demo)
-        im.thumbnail((256, 256))
-        arr = np.asarray(im, dtype=np.float32)
-
-        mean_r = float(np.mean(arr[:,:,0])); std_r = float(np.std(arr[:,:,0]))
-        mean_g = float(np.mean(arr[:,:,1])); std_g = float(np.std(arr[:,:,1]))
-        mean_b = float(np.mean(arr[:,:,2])); std_b = float(np.std(arr[:,:,2]))
-
-        gray = (0.299*arr[:,:,0] + 0.587*arr[:,:,1] + 0.114*arr[:,:,2]).astype(np.uint8)
-        hist, _ = np.histogram(gray, bins=256, range=(0,255), density=True)
-        hist = hist + 1e-12
-        entropy = float(-np.sum(hist * np.log2(hist)))
-
-        return (mean_r, mean_g, mean_b, std_r, std_g, std_b, entropy)
-    except Exception:
-        return (float("nan"),)*7
+def MostrarColumnasCSV():
+    with open(META, 'r') as f:
+        header = f.readline().strip()
+        print("Columnas en el CSV de metadatos:")
+        print(header)
+    #mostrar tipo de datos
+    df = spark.read.option("header", True).option("inferSchema", True).csv(META)
+    print("Tipos de datos inferidos:")  
+    df.printSchema()
+    #mostar valores nulos por columna
+    print("Valores nulos por columna:")
+    for col_name in df.columns:
+        null_count = df.filter(col(col_name).isNull()).count()
+        print(f"{col_name}: {null_count} nulos")
+    #mostar estadisticas descriptivas de valores numericos
+    print("Estadísticas descriptivas de columnas numéricas:")
+    numeric_cols = [field.name for field in df.schema.fields if isinstance(field.dataType, (DoubleType,))]
+    df.select(numeric_cols).describe().show()
 
 
 # =========================
 # Main (Spark)
 # =========================
 if __name__ == "__main__":
+    
     # 1) Asegurar datos (descarga si faltan)
     print("[INFO] Preparando datos…")
     download_and_extract_zip()
@@ -168,8 +164,11 @@ if __name__ == "__main__":
     # 2) Spark session
     spark = (SparkSession.builder
              .appName("HAM10000_Etapa2_Completo")
+             .config("spark.executor.extraJavaOptions", "-Dlog4j.rootCategory=WARN,console")
+             .config("spark.driver.extraJavaOptions", "-Dlog4j.rootCategory=WARN,console")
              .getOrCreate())
-
+    spark.sparkContext.setLogLevel("WARN")
+    
     # 3) Lectura de metadatos + muestreo
     df_raw = (spark.read
               .option("header", True)
@@ -187,60 +186,5 @@ if __name__ == "__main__":
           .withColumn("age", col("age").cast("double"))
           .withColumn("age_imputed", when(col("age").isNull(), 45.0).otherwise(col("age")))
           .withColumn("img_path", resolve_path_udf(col("image_id"))))
-
-    schema = StructType([
-        StructField("mean_r",  DoubleType()),
-        StructField("mean_g",  DoubleType()),
-        StructField("mean_b",  DoubleType()),
-        StructField("std_r",   DoubleType()),
-        StructField("std_g",   DoubleType()),
-        StructField("std_b",   DoubleType()),
-        StructField("entropy", DoubleType()),
-    ])
-    img_udf = udf(image_features, schema)
-
-    feat = df.withColumn("img_feats", img_udf(col("img_path")))
-    for c in ["mean_r","mean_g","mean_b","std_r","std_g","std_b","entropy"]:
-        feat = feat.withColumn(c, col("img_feats").getItem(c))
-    feat = feat.drop("img_feats")
-
-    # Filtrar filas válidas
-    feat = feat.na.drop(subset=["mean_r","mean_g","mean_b","entropy","dx"])
-
-    # 5) EDA breve
-    feat.createOrReplaceTempView("lesiones")
-    spark.sql("""
-      SELECT dx, COUNT(*) AS n, ROUND(AVG(age_imputed),1) AS edad_prom
-      FROM lesiones
-      GROUP BY dx ORDER BY n DESC
-    """).show(truncate=False)
-
-    # 6) Modelo MLlib (Logistic Regression) imágenes + metadatos
-    dx_idx  = StringIndexer(inputCol="dx", outputCol="label", handleInvalid="skip")
-    sex_idx = StringIndexer(inputCol="sex", outputCol="sex_ix", handleInvalid="keep")
-    loc_idx = StringIndexer(inputCol="localization", outputCol="loc_ix", handleInvalid="keep")
-
-    assembler = VectorAssembler(
-        inputCols=[
-            "age_imputed","sex_ix","loc_ix",
-            "mean_r","mean_g","mean_b",
-            "std_r","std_g","std_b",
-            "entropy"
-        ],
-        outputCol="features"
-    )
-    clf = LogisticRegression(featuresCol="features", labelCol="label", maxIter=50)
-
-    pipeline = Pipeline(stages=[dx_idx, sex_idx, loc_idx, assembler, clf])
-
-    train, test = feat.randomSplit([0.8, 0.2], seed=123)
-    model = pipeline.fit(train)
-    pred  = model.transform(test)
-
-    acc = MulticlassClassificationEvaluator(metricName="accuracy",
-                                            labelCol="label",
-                                            predictionCol="prediction").evaluate(pred)
-    print(f"=== Accuracy (demo imágenes + metadatos): {acc:.3f} ===")
-    pred.select("image_id","dx","age_imputed","sex","localization","prediction").show(10, False)
-
+    MostrarColumnasCSV()
     spark.stop()
