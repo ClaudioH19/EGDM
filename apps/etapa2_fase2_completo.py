@@ -151,6 +151,21 @@ def MostrarColumnasCSV():
     numeric_cols = [field.name for field in df.schema.fields if isinstance(field.dataType, (DoubleType,))]
     df.select(numeric_cols).describe().show()
 
+def MostrarEstadisticas(df, column):
+    #Mostrar estadística: Cantidad de imágenes, cantidad de imágenes sin etiqueta, etiquetas distintas
+    total_count = df.count()
+    null_count = df.filter(col(column).isNull()).count()
+    distinct_labels = df.select(column).distinct().collect()
+    distinct_labels_list = [row[column] for row in distinct_labels if row[column] is
+    not None]
+    print(f"Total de imágenes: {total_count}")
+    print(f"Imágenes sin etiqueta en '{column}': {null_count}")
+    print(f"Etiquetas distintas en '{column}': {distinct_labels_list}")
+    # mostrar las etiquetas de los valores de la clase objetivo
+    label_counts = df.groupBy(column).count().collect()
+    print(f"Conteo de etiquetas en '{column}':")
+    for row in label_counts:
+        print(f"  {row[column]}: {row['count']}")
 
 # =========================
 # Main (Spark)
@@ -187,4 +202,10 @@ if __name__ == "__main__":
           .withColumn("age_imputed", when(col("age").isNull(), 45.0).otherwise(col("age")))
           .withColumn("img_path", resolve_path_udf(col("image_id"))))
     MostrarColumnasCSV()
+    MostrarEstadisticas(df, "dx")
+    MostrarEstadisticas(df, "dx_type")
+    MostrarEstadisticas(df, "sex")
+    MostrarEstadisticas(df, "age")
+    MostrarEstadisticas(df, "localization")
+    
     spark.stop()
