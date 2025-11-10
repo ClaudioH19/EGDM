@@ -1,6 +1,6 @@
 pillow
 numpy
 gdown
-opencv-python
+opencv-python-headless
 matplotlib
 pandas

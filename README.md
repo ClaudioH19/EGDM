@@ -21,9 +21,14 @@ NAH descartado
 bcc --> malignant
 
 
-(4) Por cada etiqueta minoritaria, se generará la cantidad de imágenes suficientes para alcanzar a la mayoritaria
-(5) Armar un script para entrenar un modelo GAN para alcanzar la cantidad de imágenes necesarias
+
+(4) Por cada etiqueta minoritaria, se generará la cantidad de imágenes suficientes para alcanzar a la mayoritaria [X]
+
+(4.a) Generar el recorte y fondo tenue en las imagenes (hecho) [Hecho]
+(4.b) Ver si se puede optimizar el trabajo entre nodos (por ver) 
+(4.c) Armar un script para entrenar un modelo GAN para alcanzar la cantidad de imágenes necesarias [X]
+
+(5) Aplicar transformaciones a todo el dataset, ya sea rotaciones, aumentar y bajar brillo, inversión y zoom  
 
 
-(6) Aplicar transformaciones a todo el dataset, ya sea rotaciones, aumentar y bajar brillo, inversión y zoom 
-(7) Aplicar parche RGB a regiones sin información (PCA para imágenes)
+
