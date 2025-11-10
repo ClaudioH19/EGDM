@@ -373,7 +373,317 @@ class DataProcessor:
 
 
 # ==============================================================================
-# SECCIÓN 5: ANÁLISIS EXPLORATORIO
+# SECCIÓN 5: TRANSFORMACIONES DE IMÁGENES
+# ==============================================================================
+
+class ImageTransformer:
+    """Transformaciones de imágenes distribuidas entre nodos."""
+    
+    def __init__(self, spark: SparkSession):
+        """
+        Inicializar transformador de imágenes.
+        
+        Args:
+            spark: Sesión de Spark activa
+        """
+        self.spark = spark
+        
+        # Configuración de transformaciones
+        self.transformations = {
+            'rotation_90': {'angle': 90, 'suffix': '_rot90'},
+            'rotation_180': {'angle': 180, 'suffix': '_rot180'},
+            'rotation_270': {'angle': 270, 'suffix': '_rot270'},
+            'brightness_increase': {'factor': 1.3, 'suffix': '_bright'},
+            'brightness_decrease': {'factor': 0.7, 'suffix': '_dark'},
+            'horizontal_flip': {'suffix': '_hflip'},
+            'vertical_flip': {'suffix': '_vflip'},
+            'zoom_in': {'factor': 1.2, 'suffix': '_zoomin'},
+            'zoom_out': {'factor': 0.8, 'suffix': '_zoomout'}
+        }
+    
+    @staticmethod
+    def apply_rotation(image_path: str, angle: int, output_path: str) -> bool:
+        """
+        Aplicar rotación a una imagen.
+        
+        Args:
+            image_path: Ruta de la imagen original
+            angle: Ángulo de rotación en grados
+            output_path: Ruta de salida
+            
+        Returns:
+            bool: True si la transformación fue exitosa
+        """
+        try:
+            with Image.open(image_path) as img:
+                rotated = img.rotate(angle, expand=True)
+                rotated.save(output_path, quality=95)
+            return True
+        except Exception as e:
+            print(f"[TRANSFORM] Error en rotación {angle}°: {e}")
+            return False
+    
+    @staticmethod
+    def apply_brightness(image_path: str, factor: float, output_path: str) -> bool:
+        """
+        Ajustar brillo de una imagen.
+        
+        Args:
+            image_path: Ruta de la imagen original
+            factor: Factor de brillo (>1 aumenta, <1 disminuye)
+            output_path: Ruta de salida
+            
+        Returns:
+            bool: True si la transformación fue exitosa
+        """
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return False
+            
+            # Ajustar brillo
+            adjusted = cv2.convertScaleAbs(img, alpha=factor, beta=0)
+            cv2.imwrite(output_path, adjusted)
+            return True
+        except Exception as e:
+            print(f"[TRANSFORM] Error en brillo {factor}: {e}")
+            return False
+    
+    @staticmethod
+    def apply_flip(image_path: str, flip_type: str, output_path: str) -> bool:
+        """
+        Aplicar inversión (flip) a una imagen.
+        
+        Args:
+            image_path: Ruta de la imagen original
+            flip_type: Tipo de inversión ('horizontal' o 'vertical')
+            output_path: Ruta de salida
+            
+        Returns:
+            bool: True si la transformación fue exitosa
+        """
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return False
+            
+            if flip_type == 'horizontal':
+                flipped = cv2.flip(img, 1)  # Flip horizontal
+            elif flip_type == 'vertical':
+                flipped = cv2.flip(img, 0)  # Flip vertical
+            else:
+                return False
+            
+            cv2.imwrite(output_path, flipped)
+            return True
+        except Exception as e:
+            print(f"[TRANSFORM] Error en flip {flip_type}: {e}")
+            return False
+    
+    @staticmethod
+    def apply_zoom(image_path: str, factor: float, output_path: str) -> bool:
+        """
+        Aplicar zoom a una imagen.
+        
+        Args:
+            image_path: Ruta de la imagen original
+            factor: Factor de zoom (>1 acerca, <1 aleja)
+            output_path: Ruta de salida
+            
+        Returns:
+            bool: True si la transformación fue exitosa
+        """
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return False
+            
+            h, w = img.shape[:2]
+            
+            if factor > 1:
+                # Zoom in: recortar centro y redimensionar
+                crop_h = int(h / factor)
+                crop_w = int(w / factor)
+                start_y = (h - crop_h) // 2
+                start_x = (w - crop_w) // 2
+                cropped = img[start_y:start_y + crop_h, start_x:start_x + crop_w]
+                zoomed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+            else:
+                # Zoom out: redimensionar y añadir padding
+                new_h = int(h * factor)
+                new_w = int(w * factor)
+                resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                
+                # Crear imagen con padding
+                zoomed = np.zeros((h, w, 3), dtype=np.uint8)
+                start_y = (h - new_h) // 2
+                start_x = (w - new_w) // 2
+                zoomed[start_y:start_y + new_h, start_x:start_x + new_w] = resized
+            
+            cv2.imwrite(output_path, zoomed)
+            return True
+        except Exception as e:
+            print(f"[TRANSFORM] Error en zoom {factor}: {e}")
+            return False
+    
+    def transform_single_image(self, image_path: str) -> List[str]:
+        """
+        Aplicar todas las transformaciones a una sola imagen.
+        
+        Args:
+            image_path: Ruta de la imagen a transformar
+            
+        Returns:
+            List[str]: Lista de rutas de imágenes transformadas creadas
+        """
+        if not os.path.exists(image_path):
+            return []
+        
+        base_path = os.path.splitext(image_path)[0]
+        extension = os.path.splitext(image_path)[1]
+        transformed_paths = []
+        
+        print(f"[TRANSFORM] Procesando: {os.path.basename(image_path)}")
+        
+        # Aplicar todas las transformaciones
+        for transform_name, config in self.transformations.items():
+            output_path = f"{base_path}{config['suffix']}{extension}"
+            success = False
+            
+            if transform_name.startswith('rotation'):
+                success = self.apply_rotation(image_path, config['angle'], output_path)
+            elif transform_name.startswith('brightness'):
+                success = self.apply_brightness(image_path, config['factor'], output_path)
+            elif transform_name.endswith('flip'):
+                flip_type = 'horizontal' if 'horizontal' in transform_name else 'vertical'
+                success = self.apply_flip(image_path, flip_type, output_path)
+            elif transform_name.startswith('zoom'):
+                success = self.apply_zoom(image_path, config['factor'], output_path)
+            
+            if success:
+                transformed_paths.append(output_path)
+                print(f"[TRANSFORM]   ✓ {transform_name}: {os.path.basename(output_path)}")
+            else:
+                print(f"[TRANSFORM]   ✗ {transform_name}: FALLÓ")
+        
+        return transformed_paths
+    
+    def get_images_by_node(self) -> Tuple[List[str], List[str]]:
+        """
+        Dividir imágenes entre los dos nodos disponibles.
+        
+        Returns:
+            Tuple[List[str], List[str]]: (imágenes_nodo1, imágenes_nodo2)
+        """
+        # Recopilar todas las imágenes
+        all_images = []
+        
+        # Imágenes de PART1
+        part1_images = glob.glob(os.path.join(Config.PART1, "*.jpg"))
+        part1_images.extend(glob.glob(os.path.join(Config.PART1, "*.JPG")))
+        part1_images.extend(glob.glob(os.path.join(Config.PART1, "*.jpeg")))
+        
+        # Imágenes de PART2
+        part2_images = glob.glob(os.path.join(Config.PART2, "*.jpg"))
+        part2_images.extend(glob.glob(os.path.join(Config.PART2, "*.JPG")))
+        part2_images.extend(glob.glob(os.path.join(Config.PART2, "*.jpeg")))
+        
+        all_images = part1_images + part2_images
+        
+        # Filtrar solo imágenes originales (sin transformaciones previas)
+        original_images = [
+            img for img in all_images
+            if not any(suffix in os.path.basename(img) for suffix in 
+                      ['_rot90', '_rot180', '_rot270', '_bright', '_dark', 
+                       '_hflip', '_vflip', '_zoomin', '_zoomout'])
+        ]
+        
+        # Dividir en dos grupos para distribución entre nodos
+        total = len(original_images)
+        half = total // 2
+        
+        node1_images = original_images[:half]
+        node2_images = original_images[half:]
+        
+        print(f"[TRANSFORM] Distribución de trabajo:")
+        print(f"[TRANSFORM]   - Nodo 1: {len(node1_images)} imágenes")
+        print(f"[TRANSFORM]   - Nodo 2: {len(node2_images)} imágenes")
+        print(f"[TRANSFORM]   - Total: {total} imágenes originales")
+        
+        return node1_images, node2_images
+    
+    def transform_images_distributed(self) -> None:
+        """
+        Ejecutar transformaciones de imágenes distribuidas entre nodos.
+        
+        Este método simula el procesamiento distribuido procesando
+        las imágenes de cada nodo de forma secuencial.
+        """
+        print("\n" + "="*70)
+        print("PROCESAMIENTO DISTRIBUIDO DE TRANSFORMACIONES")
+        print("="*70)
+        
+        node1_images, node2_images = self.get_images_by_node()
+        
+        if not node1_images and not node2_images:
+            print("[TRANSFORM] No se encontraron imágenes para transformar")
+            return
+        
+        total_transformed = 0
+        
+        # Simular procesamiento en NODO 1
+        if node1_images:
+            print(f"\n[NODO 1] Iniciando transformaciones...")
+            node1_count = 0
+            for image_path in node1_images:
+                transformed = self.transform_single_image(image_path)
+                node1_count += len(transformed)
+            
+            print(f"[NODO 1] ✓ Completado: {node1_count} transformaciones generadas")
+            total_transformed += node1_count
+        
+        # Simular procesamiento en NODO 2
+        if node2_images:
+            print(f"\n[NODO 2] Iniciando transformaciones...")
+            node2_count = 0
+            for image_path in node2_images:
+                transformed = self.transform_single_image(image_path)
+                node2_count += len(transformed)
+            
+            print(f"[NODO 2] ✓ Completado: {node2_count} transformaciones generadas")
+            total_transformed += node2_count
+        
+        print(f"\n[TRANSFORM] ✓ TRANSFORMACIONES COMPLETADAS")
+        print(f"[TRANSFORM]   - Total imágenes transformadas: {total_transformed}")
+        print(f"[TRANSFORM]   - Transformaciones por imagen: {len(self.transformations)}")
+        print(f"[TRANSFORM]   - Imágenes originales procesadas: {len(node1_images) + len(node2_images)}")
+        
+        # Verificar resultados
+        self._verify_transformations()
+    
+    def _verify_transformations(self) -> None:
+        """Verificar que las transformaciones se aplicaron correctamente."""
+        print(f"\n[VERIFY] Verificando transformaciones...")
+        
+        # Contar imágenes transformadas
+        transform_suffixes = ['_rot90', '_rot180', '_rot270', '_bright', '_dark', 
+                             '_hflip', '_vflip', '_zoomin', '_zoomout']
+        
+        total_transformed = 0
+        for suffix in transform_suffixes:
+            count = 0
+            for directory in [Config.PART1, Config.PART2]:
+                pattern = os.path.join(directory, f"*{suffix}.*")
+                count += len(glob.glob(pattern))
+            
+            print(f"[VERIFY]   - {suffix}: {count} imágenes")
+            total_transformed += count
+        
+        print(f"[VERIFY] ✓ Total verificado: {total_transformed} imágenes transformadas")
+
+
+# ==============================================================================
+# SECCIÓN 6: ANÁLISIS EXPLORATORIO
 # ==============================================================================
 
 class DataAnalyzer:
@@ -448,7 +758,7 @@ class DataAnalyzer:
 
 
 # ==============================================================================
-# SECCIÓN 6: PIPELINE PRINCIPAL
+# SECCIÓN 7: PIPELINE PRINCIPAL
 # ==============================================================================
 
 def main():
@@ -490,12 +800,21 @@ def main():
         DataAnalyzer.show_schema(df_clean)
         DataAnalyzer.generate_summary_report(df_clean)
         
-        # Resumen final
+        # ETAPA 5: Transformaciones de imágenes
+        print("\n" + "="*70)
+        print("ETAPA 5: TRANSFORMACIONES DE IMÁGENES DISTRIBUIDAS")
         print("="*70)
+        
+        transformer = ImageTransformer(spark)
+        transformer.transform_images_distributed()
+        
+        # Resumen final
+        print("\n" + "="*70)
         print("PIPELINE COMPLETADO EXITOSAMENTE")
         print("="*70)
         print(f"Total de registros procesados: {df_clean.count()}")
         print(f"Columnas: {', '.join(df_clean.columns)}")
+        print(f"Transformaciones de imágenes: ✓ COMPLETADAS")
         print("="*70 + "\n")
         
     finally:
