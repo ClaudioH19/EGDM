@@ -12,6 +12,9 @@ from PIL import Image
 import glob
 from collections import Counter
 import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+from PIL import ImageEnhance, ImageOps
 
 # ========= Configuración =========
 # Detectar si estamos en contenedor Docker o entorno local
@@ -413,13 +416,190 @@ def main():
     print("\n[INFO] ¡Generación de imágenes sintéticas completada!")
     print(f"[INFO] Las imágenes sintéticas están guardadas en: {SYNTHETIC_DIR}")
 
-if __name__ == "__main__":
-    # Configurar GPU si está disponible
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if physical_devices:
-        tf.config.experimental.set_memory_growth(physical_devices[0], True)
-        print(f"[INFO] GPU disponible: {physical_devices[0]}")
+
+# ======== Data augmentation utilities (applies to whole dataset) ========
+def ensure_augmented_dir(out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+
+
+def apply_rotation(pil_img, angle):
+    return pil_img.rotate(angle, resample=Image.BICUBIC, expand=False)
+
+
+def apply_brightness(pil_img, factor):
+    enhancer = ImageEnhance.Brightness(pil_img)
+    return enhancer.enhance(factor)
+
+
+def apply_flip(pil_img, mode="horizontal"):
+    if mode == "horizontal":
+        return ImageOps.mirror(pil_img)
+    elif mode == "vertical":
+        return ImageOps.flip(pil_img)
     else:
-        print("[INFO] Usando CPU para entrenamiento")
-    
-    main()
+        return pil_img
+
+
+def apply_zoom(pil_img, zoom_factor):
+    # zoom_factor >1 -> zoom in (crop center then resize back)
+    # zoom_factor <1 -> zoom out (shrink then pad)
+    w, h = pil_img.size
+    if zoom_factor == 1.0:
+        return pil_img
+
+    if zoom_factor > 1.0:
+        new_w = int(w / zoom_factor)
+        new_h = int(h / zoom_factor)
+        left = (w - new_w) // 2
+        top = (h - new_h) // 2
+        right = left + new_w
+        bottom = top + new_h
+        cropped = pil_img.crop((left, top, right, bottom))
+        return cropped.resize((w, h), Image.LANCZOS)
+    else:
+        # zoom out: shrink image then paste it centered on background
+        new_w = int(w * zoom_factor)
+        new_h = int(h * zoom_factor)
+        resized = pil_img.resize((new_w, new_h), Image.LANCZOS)
+        background = Image.new(pil_img.mode, (w, h))
+        left = (w - new_w) // 2
+        top = (h - new_h) // 2
+        background.paste(resized, (left, top))
+        return background
+
+
+def augment_image_file(src_path, out_dir, transforms, skip_existing=True):
+    """Crea y guarda versiones aumentadas de una imagen.
+
+    transforms: dict with keys 'rotations', 'brightness', 'flips', 'zooms'
+    """
+    src_path = Path(src_path)
+    try:
+        pil_img = Image.open(src_path).convert('RGB')
+    except Exception as e:
+        print(f"[WARN] No se pudo abrir {src_path}: {e}")
+        return 0
+
+    base_name = src_path.stem
+    ext = src_path.suffix.lower() or '.jpg'
+    saved = 0
+
+    # Always save a resized/canonical copy too
+    out_base = Path(out_dir) / (base_name + ext)
+    if not (skip_existing and out_base.exists()):
+        pil_img.save(out_base)
+        saved += 1
+
+    # Rotations
+    for angle in transforms.get('rotations', []):
+        img_rot = apply_rotation(pil_img, angle)
+        out_path = Path(out_dir) / f"{base_name}_rot{angle}{ext}"
+        if not (skip_existing and out_path.exists()):
+            img_rot.save(out_path)
+            saved += 1
+
+    # Brightness
+    for factor in transforms.get('brightness', []):
+        img_b = apply_brightness(pil_img, factor)
+        out_path = Path(out_dir) / f"{base_name}_bright{factor:.2f}{ext}"
+        if not (skip_existing and out_path.exists()):
+            img_b.save(out_path)
+            saved += 1
+
+    # Flips
+    for mode in transforms.get('flips', []):
+        img_f = apply_flip(pil_img, mode)
+        out_path = Path(out_dir) / f"{base_name}_flip{mode}{ext}"
+        if not (skip_existing and out_path.exists()):
+            img_f.save(out_path)
+            saved += 1
+
+    # Zooms
+    for z in transforms.get('zooms', []):
+        img_z = apply_zoom(pil_img, z)
+        out_path = Path(out_dir) / f"{base_name}_zoom{z:.2f}{ext}"
+        if not (skip_existing and out_path.exists()):
+            img_z.save(out_path)
+            saved += 1
+
+    return saved
+
+
+def augment_dataset(src_dirs, out_dir, transforms, exts=None, recursive=True, skip_existing=True):
+    """Aplica aumentos a todos los archivos de imagen en src_dirs y guarda en out_dir."""
+    ensure_augmented_dir(out_dir)
+    total_saved = 0
+    if exts is None:
+        exts = ['.jpg', '.jpeg', '.png', '.JPG', '.JPEG']
+
+    patterns = []
+    for d in src_dirs:
+        dpath = Path(d)
+        if recursive:
+            patterns.extend([str(dpath / '**' / f'*{e}') for e in exts])
+        else:
+            patterns.extend([str(dpath / f'*{e}') for e in exts])
+
+    seen = set()
+    files = []
+    for pat in patterns:
+        files.extend(glob.glob(pat, recursive=recursive))
+
+    files = sorted(set(files))
+    print(f"[INFO] Encontradas {len(files)} imágenes para procesar")
+
+    for i, fpath in enumerate(files, 1):
+        rel = os.path.relpath(fpath, start=src_dirs[0] if src_dirs else '.')
+        out_subdir = Path(out_dir) / Path(rel).parent
+        out_subdir.mkdir(parents=True, exist_ok=True)
+        saved = augment_image_file(fpath, out_subdir, transforms, skip_existing=skip_existing)
+        total_saved += saved
+        if i % 100 == 0:
+            print(f"[INFO] Procesadas {i}/{len(files)} imágenes, guardadas hasta ahora: {total_saved}")
+
+    print(f"[INFO] Aumento completado. Total de archivos guardados (incluye copias): {total_saved}")
+    return total_saved
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="GAN + dataset augmentation helper")
+    parser.add_argument('--augment-only', action='store_true', help='Solo aplicar aumentos al dataset y salir')
+    parser.add_argument('--src-dirs', nargs='+', default=[PART1, PART2], help='Directorios fuente de imágenes (espacio-separados)')
+    parser.add_argument('--out-dir', default=os.path.join(DATA_DIR, 'augmented_images'), help='Directorio donde guardar imágenes aumentadas')
+    parser.add_argument('--rotations', nargs='*', type=float, default=[-15.0, 15.0], help='Ángulos de rotación en grados')
+    parser.add_argument('--brightness', nargs='*', type=float, default=[0.8, 1.2], help='Factores de brillo (ej: 0.8 para bajar, 1.2 para subir)')
+    parser.add_argument('--flips', nargs='*', default=['horizontal'], help='Tipos de flip: horizontal, vertical')
+    parser.add_argument('--zooms', nargs='*', type=float, default=[0.9, 1.1], help='Factores de zoom (ej: 0.9, 1.1)')
+    parser.add_argument('--skip-existing', action='store_true', help='No sobrescribir archivos ya existentes en el directorio de salida')
+    parser.add_argument('--no-gpu', action='store_true', help='Desactivar configuración automática de GPU (útil en entornos sin TF)')
+
+    args = parser.parse_args()
+
+    # Intentar configurar GPU (si se usa TensorFlow y no está desactivado)
+    if not args.no_gpu:
+        try:
+            physical_devices = tf.config.list_physical_devices('GPU')
+            if physical_devices:
+                tf.config.experimental.set_memory_growth(physical_devices[0], True)
+                print(f"[INFO] GPU disponible: {physical_devices[0]}")
+            else:
+                print("[INFO] Usando CPU para entrenamiento")
+        except Exception:
+            # Falló la detección/configuración de TF (p.ej. TF no instalado); continuar sin GPU
+            print("[WARN] No se pudo configurar GPU o TensorFlow no disponible. Continuando sin configuración GPU.")
+
+    # Si el usuario pide solo augmentación, ejecutarla y salir
+    if args.augment_only:
+        transforms = {
+            'rotations': args.rotations,
+            'brightness': args.brightness,
+            'flips': args.flips,
+            'zooms': args.zooms
+        }
+        print(f"[INFO] Ejecutando augmentación en: {args.src_dirs}")
+        print(f"[INFO] Guardando en: {args.out_dir}")
+        augment_dataset(args.src_dirs, args.out_dir, transforms, skip_existing=args.skip_existing)
+    else:
+        # Ejecutar flujo GAN original
+        main()
