@@ -132,13 +132,12 @@ def resolve_path(image_id: str):
             return p
     return None
 
-def MostrarColumnasCSV():
+def MostrarColumnasCSV(df):
     with open(META, 'r') as f:
         header = f.readline().strip()
         print("Columnas en el CSV de metadatos:")
         print(header)
     #mostrar tipo de datos
-    df = spark.read.option("header", True).option("inferSchema", True).csv(META)
     print("Tipos de datos inferidos:")  
     df.printSchema()
     #mostar valores nulos por columna
@@ -189,23 +188,55 @@ if __name__ == "__main__":
               .option("header", True)
               .option("inferSchema", True)
               .csv(META))
-    frac = max(0.01, min(SAMPLE_FRACTION, 1.0))
+    frac = max(1.0, min(SAMPLE_FRACTION, 1.0))
     df_raw = df_raw.sample(False, frac, seed=42)
 
     # 4) Resolver rutas de imagen y extraer features
     resolve_path_udf = udf(resolve_path, StringType())
 
     df = (df_raw
-          .select("image_id","dx","sex","age","localization")
+          .select("image_id","dx","dx_type","sex","age","localization")
           .withColumn("image_id", col("image_id").cast(StringType()))
           .withColumn("age", col("age").cast("double"))
-          .withColumn("age_imputed", when(col("age").isNull(), 45.0).otherwise(col("age")))
           .withColumn("img_path", resolve_path_udf(col("image_id"))))
-    MostrarColumnasCSV()
+        
+        # Identificar imágenes asociadas a filas con 'age' nulo
+    null_age_images = df_raw.filter(col("age").isNull())
+    null_image_paths = null_age_images.withColumn("img_path", resolve_path_udf(col("image_id")))
+    
+    # Recopilar las rutas de las imágenes a eliminar
+    image_paths_to_delete = [row["img_path"] for row in null_image_paths.collect() if row["img_path"] is not None]
+
+    # Eliminar las imágenes del sistema de archivos
+    for img_path in image_paths_to_delete:
+        if os.path.exists(img_path):
+            os.remove(img_path)
+            print(f"[INFO] Imagen eliminada: {img_path}")
+
+    # Filtrar las filas con 'age' nulo del DataFrame
+    df = df.filter(col("age").isNotNull())
+    df = df.filter(col("img_path").isNotNull())
+
+    # Depuración: verificar filas antes y después de filtrar nulos en 'age'
+    print(f"[DEBUG] Filas antes de filtrar nulos en 'age': {df.count()}")
+    df = df.filter(col("age").isNotNull())
+    print(f"[DEBUG] Filas después de filtrar nulos en 'age': {df.count()}")
+
+    # Verificar valores nulos después de aplicar los filtros
+    print("Valores nulos por columna después de filtrar:")
+    for col_name in df.columns:
+        null_count = df.filter(col(col_name).isNull()).count()
+        print(f"{col_name}: {null_count} nulos")
+
+    print(f"[INFO] Filas después de eliminar nulos en 'age' y rutas de imagen: {df.count()}")
+
+    MostrarColumnasCSV(df)
     MostrarEstadisticas(df, "dx")
     MostrarEstadisticas(df, "dx_type")
     MostrarEstadisticas(df, "sex")
     MostrarEstadisticas(df, "age")
     MostrarEstadisticas(df, "localization")
+    
+    print(f"[INFO] Filas después de eliminar nulos en 'age' y rutas de imagen: {df.count()}")
     
     spark.stop()

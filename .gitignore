@@ -1,0 +1,67 @@
+# ===============================
+# Proyecto Spark + Docker + Python
+# ===============================
+
+# --- Carpetas de datos grandes o privadas ---
+data/
+*.zip
+*.tar
+*.tar.gz
+
+# --- Archivos de entorno y configuración ---
+.env
+.env.*
+*.bak
+*.tmp
+
+# --- Archivos de Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# --- Configuración de notebooks ---
+.ipynb_checkpoints/
+
+# --- Archivos de salida / compilación ---
+build/
+dist/
+*.egg-info/
+*.egg
+
+# --- Configuración de IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- Archivos del sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Archivos de Docker ---
+*.pid
+*.seed
+docker-compose.override.yml
+
+# --- Archivos generados por Spark ---
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+
+# --- Archivos temporales o intermedios ---
+tmp/
+temp/
+logs/
+output/
+.cache/
+__MACOSX/
+
+# --- Repositorios de dependencias ---
+node_modules/
+venv/
+.env/
+.venv/
+
