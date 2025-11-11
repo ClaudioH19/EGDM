@@ -52,7 +52,7 @@ class Config:
     GDRIVE_ID = "1G4ui_xWXDkhSMNpwV_3mlrgoOgIDt8TG"
     
     # Configuración de procesamiento
-    SAMPLE_FRACTION = float(os.environ.get("ETAPA2_SAMPLE", "1.0"))
+    SAMPLE_FRACTION = float(os.environ.get("ETAPA2_SAMPLE", "0.25"))
     
     @classmethod
     def initialize(cls):
@@ -568,34 +568,25 @@ class ImageTransformer:
         
         return transformed_paths
     
-    def get_images_by_node(self) -> Tuple[List[str], List[str]]:
+    def get_images_from_dataframe(self, df: DataFrame) -> Tuple[List[str], List[str]]:
         """
-        Dividir imágenes entre los dos nodos disponibles.
+        Obtener imágenes del DataFrame y dividirlas entre los dos nodos disponibles.
+        RESPETA EL SAMPLE_FRACTION aplicado al DataFrame.
+        
+        Args:
+            df: DataFrame de Spark con columna 'img_path'
         
         Returns:
             Tuple[List[str], List[str]]: (imágenes_nodo1, imágenes_nodo2)
         """
-        # Recopilar todas las imágenes
-        all_images = []
+        # Recopilar rutas de imágenes del DataFrame (ya filtrado por sample)
+        print(f"[TRANSFORM] Obteniendo imágenes del DataFrame filtrado...")
+        image_rows = df.select("img_path").collect()
         
-        # Imágenes de PART1
-        part1_images = glob.glob(os.path.join(Config.PART1, "*.jpg"))
-        part1_images.extend(glob.glob(os.path.join(Config.PART1, "*.JPG")))
-        part1_images.extend(glob.glob(os.path.join(Config.PART1, "*.jpeg")))
-        
-        # Imágenes de PART2
-        part2_images = glob.glob(os.path.join(Config.PART2, "*.jpg"))
-        part2_images.extend(glob.glob(os.path.join(Config.PART2, "*.JPG")))
-        part2_images.extend(glob.glob(os.path.join(Config.PART2, "*.jpeg")))
-        
-        all_images = part1_images + part2_images
-        
-        # Filtrar solo imágenes originales (sin transformaciones previas)
+        # Extraer rutas válidas
         original_images = [
-            img for img in all_images
-            if not any(suffix in os.path.basename(img) for suffix in 
-                      ['_rot90', '_rot180', '_rot270', '_bright', '_dark', 
-                       '_hflip', '_vflip', '_zoomin', '_zoomout'])
+            row["img_path"] for row in image_rows 
+            if row["img_path"] is not None and os.path.exists(row["img_path"])
         ]
         
         # Dividir en dos grupos para distribución entre nodos
@@ -608,22 +599,24 @@ class ImageTransformer:
         print(f"[TRANSFORM] Distribución de trabajo:")
         print(f"[TRANSFORM]   - Nodo 1: {len(node1_images)} imágenes")
         print(f"[TRANSFORM]   - Nodo 2: {len(node2_images)} imágenes")
-        print(f"[TRANSFORM]   - Total: {total} imágenes originales")
+        print(f"[TRANSFORM]   - Total: {total} imágenes del DataFrame")
+        print(f"[TRANSFORM]   - SAMPLE_FRACTION aplicado: {Config.SAMPLE_FRACTION}")
         
         return node1_images, node2_images
     
-    def transform_images_distributed(self) -> None:
+    def transform_images_distributed(self, df: DataFrame) -> None:
         """
         Ejecutar transformaciones de imágenes distribuidas entre nodos.
+        RESPETA EL SAMPLE_FRACTION: solo procesa imágenes del DataFrame filtrado.
         
-        Este método simula el procesamiento distribuido procesando
-        las imágenes de cada nodo de forma secuencial.
+        Args:
+            df: DataFrame de Spark con columna 'img_path' (ya filtrado por sample)
         """
         print("\n" + "="*70)
         print("PROCESAMIENTO DISTRIBUIDO DE TRANSFORMACIONES")
         print("="*70)
         
-        node1_images, node2_images = self.get_images_by_node()
+        node1_images, node2_images = self.get_images_from_dataframe(df)
         
         if not node1_images and not node2_images:
             print("[TRANSFORM] No se encontraron imágenes para transformar")
@@ -758,7 +751,228 @@ class DataAnalyzer:
 
 
 # ==============================================================================
-# SECCIÓN 7: PIPELINE PRINCIPAL
+# SECCIÓN 6: PREPROCESAMIENTO DE IMÁGENES (DISTRIBUIDO CON SPARK)
+# ==============================================================================
+
+class ImagePreprocessor:
+    """
+    Preprocesamiento distribuido de imágenes con Apache Spark.
+    
+    Procesa imágenes in-place (modifica las originales) usando:
+    - Recorte de bordes y artefactos (reglas, viñeteo)
+    - Detección y extracción del ROI del lunar
+    - Atenuación del fondo para resaltar la lesión
+    - Redimensionamiento a 128x128 píxeles
+    
+    Utiliza Spark para distribución del procesamiento entre workers.
+    """
+    
+    @staticmethod
+    def _safe_border_crop(image_rgb: np.ndarray, border_ratio: float = 0.03) -> np.ndarray:
+        """Recortar bordes de la imagen para eliminar artefactos."""
+        h, w = image_rgb.shape[:2]
+        dy, dx = int(h * border_ratio), int(w * border_ratio)
+        return image_rgb[dy:h-dy, dx:w-dx]
+    
+    @staticmethod
+    def _auto_roi_crop(
+        image_rgb: np.ndarray, 
+        out_size: Tuple[int, int] = (128, 128), 
+        pad_ratio: float = 0.15
+    ) -> np.ndarray:
+        """
+        Detectar automáticamente ROI del lunar usando espacios de color Lab/HSV.
+        """
+        img = image_rgb
+        h, w = img.shape[:2]
+        
+        # Convertir a espacios de color Lab y HSV
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab)
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        
+        # Mapa de "oscuridad/pigmento"
+        a = lab[:, :, 1].astype(np.float32)
+        b = lab[:, :, 2].astype(np.float32)
+        s = hsv[:, :, 1].astype(np.float32)
+        v = hsv[:, :, 2].astype(np.float32)
+        
+        score = (0.6 * (255.0 - v) + 0.3 * s + 0.1 * (a + b)).astype(np.uint8)
+        
+        # Umbralización con Otsu + morfología
+        _, mask = cv2.threshold(score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = np.ones((7, 7), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Encontrar contornos
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Fallback: crop central cuadrado
+        if not cnts:
+            side = min(h, w)
+            y0 = (h - side) // 2
+            x0 = (w - side) // 2
+            crop = img[y0:y0+side, x0:x0+side]
+            return cv2.resize(crop, out_size, interpolation=cv2.INTER_AREA)
+        
+        # Contorno más grande (lunar)
+        c = max(cnts, key=cv2.contourArea)
+        x, y, bw, bh = cv2.boundingRect(c)
+        
+        # Padding relativo
+        px = int(bw * pad_ratio)
+        py = int(bh * pad_ratio)
+        x0 = max(0, x - px)
+        y0 = max(0, y - py)
+        x1 = min(w, x + bw + px)
+        y1 = min(h, y + bh + py)
+        
+        crop = img[y0:y1, x0:x1]
+        return cv2.resize(crop, out_size, interpolation=cv2.INTER_AREA)
+    
+    @staticmethod
+    def _attenuate_background(image_rgb: np.ndarray, attenuation_factor: float = 0.6) -> np.ndarray:
+        """Atenuar el brillo del fondo para resaltar la lesión."""
+        img = image_rgb.copy()
+        
+        # Convertir a HSV y Lab
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2Lab)
+        
+        # Crear máscara de la lesión
+        a = lab[:, :, 1].astype(np.float32)
+        b = lab[:, :, 2].astype(np.float32)
+        s = hsv[:, :, 1].astype(np.float32)
+        v = hsv[:, :, 2].astype(np.float32)
+        
+        score = (0.6 * (255.0 - v) + 0.3 * s + 0.1 * (a + b)).astype(np.uint8)
+        _, mask = cv2.threshold(score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Morfología para suavizar
+        kernel = np.ones((9, 9), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.GaussianBlur(mask, (21, 21), 0)
+        
+        # Normalizar máscara
+        mask_norm = mask.astype(np.float32) / 255.0
+        background_mask = 1.0 - mask_norm
+        
+        # Aplicar atenuación
+        img_float = img.astype(np.float32)
+        for c in range(3):
+            img_float[:, :, c] = (
+                img_float[:, :, c] * mask_norm +  
+                img_float[:, :, c] * background_mask * attenuation_factor
+            )
+        
+        return np.clip(img_float, 0, 255).astype(np.uint8)
+    
+    @staticmethod
+    def process_image_inplace(img_path: Optional[str]) -> str:
+        """
+        Pipeline completo de preprocesamiento que modifica la imagen original.
+        Esta función será ejecutada por Spark workers de forma distribuida.
+        
+        Args:
+            img_path: Ruta de la imagen a procesar
+        
+        Returns:
+            Status de procesamiento: "SUCCESS", "SKIPPED", o "FAILED"
+        """
+        if not img_path or not os.path.exists(img_path):
+            return "SKIPPED"
+        
+        try:
+            # Leer imagen original
+            bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if bgr is None:
+                return "FAILED"
+            
+            # Convertir BGR a RGB
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            
+            # Pipeline de procesamiento
+            # Paso 1: Recortar bordes/artefactos
+            rgb = ImagePreprocessor._safe_border_crop(rgb, border_ratio=0.03)
+            
+            # Paso 2: Auto-crop al ROI del lunar + resize a 128x128
+            rgb = ImagePreprocessor._auto_roi_crop(rgb, out_size=(128, 128), pad_ratio=0.15)
+            
+            # Paso 3: Atenuar fondo
+            rgb = ImagePreprocessor._attenuate_background(rgb, attenuation_factor=0.6)
+            
+            # Guardar SOBRE LA IMAGEN ORIGINAL (in-place)
+            bgr_processed = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(img_path, bgr_processed, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            
+            return "SUCCESS"
+            
+        except Exception as e:
+            return f"FAILED: {str(e)}"
+    
+    @staticmethod
+    def process_dataset_distributed(df: DataFrame, spark: SparkSession) -> DataFrame:
+        """
+        Procesar todas las imágenes del dataset de forma distribuida con Spark.
+        Modifica las imágenes originales in-place.
+        
+        Args:
+            df: DataFrame de Spark con columna 'img_path'
+            spark: Sesión de Spark activa
+        
+        Returns:
+            DataFrame con columna adicional 'processing_status'
+        """
+        print(f"\n{'='*70}")
+        print(f"ETAPA 5: PREPROCESAMIENTO DISTRIBUIDO DE IMÁGENES")
+        print(f"{'='*70}")
+        
+        # Contar imágenes a procesar
+        total_images = df.count()
+        print(f"[PREPROCESS] Imágenes a procesar: {total_images}")
+        print(f"[PREPROCESS] Tamaño objetivo: 128x128 píxeles")
+        print(f"[PREPROCESS] Modo: IN-PLACE (modifica originales)")
+        print(f"[PREPROCESS] Procesamiento: DISTRIBUIDO con Spark")
+        
+        # Crear UDF de Spark para procesamiento distribuido
+        from pyspark.sql.functions import udf
+        from pyspark.sql.types import StringType
+        
+        process_udf = udf(ImagePreprocessor.process_image_inplace, StringType())
+        
+        # Aplicar procesamiento distribuido
+        print(f"\n[PREPROCESS] Iniciando procesamiento distribuido...")
+        df_processed = df.withColumn("processing_status", process_udf(col("img_path")))
+        
+        # Forzar ejecución y cachear resultado
+        df_processed.cache()
+        
+        # Recopilar estadísticas
+        status_counts = df_processed.groupBy("processing_status").count().collect()
+        
+        print(f"\n[PREPROCESS] ✓ Procesamiento completado\n")
+        print(f"[PREPROCESS] Estadísticas:")
+        
+        success_count = 0
+        for status_row in status_counts:
+            status = status_row["processing_status"]
+            count = status_row["count"]
+            
+            if status == "SUCCESS":
+                success_count = count
+                print(f"[PREPROCESS]   ✓ Exitosas: {count}")
+            elif status == "SKIPPED":
+                print(f"[PREPROCESS]   ⊘ Omitidas: {count}")
+            else:
+                print(f"[PREPROCESS]   ✗ Fallidas: {count}")
+        
+        print(f"\n[PREPROCESS] Tasa de éxito: {(success_count/total_images)*100:.2f}%")
+        print(f"[PREPROCESS] Imágenes modificadas en: {Config.PART1} y {Config.PART2}\n")
+        
+        return df_processed
+
+
+# ==============================================================================
+# SECCIÓN 8: PIPELINE PRINCIPAL
 # ==============================================================================
 
 def main():
@@ -806,15 +1020,22 @@ def main():
         print("="*70)
         
         transformer = ImageTransformer(spark)
-        transformer.transform_images_distributed()
+        transformer.transform_images_distributed(df_clean)  # Pasamos el DataFrame filtrado
         
+        # ETAPA 6: Preprocesamiento distribuido de imágenes
+        df_final = ImagePreprocessor.process_dataset_distributed(df_clean, spark)
+
+
         # Resumen final
         print("\n" + "="*70)
         print("PIPELINE COMPLETADO EXITOSAMENTE")
         print("="*70)
-        print(f"Total de registros procesados: {df_clean.count()}")
-        print(f"Columnas: {', '.join(df_clean.columns)}")
-        print(f"Transformaciones de imágenes: ✓ COMPLETADAS")
+        print(f"SAMPLE_FRACTION utilizado: {Config.SAMPLE_FRACTION} ({Config.SAMPLE_FRACTION*100:.1f}%)")
+        print(f"Total de registros procesados: {df_final.count()}")
+        print(f"Columnas: {', '.join(df_final.columns)}")
+        print(f"Transformaciones de imágenes: ✓ COMPLETADAS (respetando sample)")
+        print(f"Preprocesamiento: ✓ COMPLETADO (modificadas in-place)")
+        print(f"Ubicación: {Config.PART1} y {Config.PART2}")
         print("="*70 + "\n")
         
     finally:
