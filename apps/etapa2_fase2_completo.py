@@ -52,7 +52,7 @@ class Config:
     GDRIVE_ID = "1G4ui_xWXDkhSMNpwV_3mlrgoOgIDt8TG"
     
     # Configuración de procesamiento
-    SAMPLE_FRACTION = float(os.environ.get("ETAPA2_SAMPLE", "0.25"))
+    SAMPLE_FRACTION = float(os.environ.get("ETAPA2_SAMPLE", "0.05"))
     
     @classmethod
     def initialize(cls):
